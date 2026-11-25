@@ -33,7 +33,9 @@ Todo follow-up termina oferecendo **dois horários** para o retorno.
 - `followup_leads`: estado por sessão (fase, checklist, resumo de até 300 caracteres, timestamps, `proximo_followup_at`, `etapa_regua`, `status`, `vendedor_id`).
 - `followup_envios`: log dos follow-ups enviados (retenção de 90 dias).
 - `webhook_amostras`: os primeiros 30 payloads de mensagem, para mapear o formato.
-- `followup_config`: `webhook_token`, `envio_ligado` (botão de desligar), `max_amostras`, `vendedores_permitidos` (opcional).
+- `followup_analises`: uma linha por análise da varredura (retenção de 90 dias).
+- `cursos`: base oficial de cursos que a IA pode citar (vazia por enquanto).
+- `followup_config`: `webhook_token`, `envio_ligado` (botão de desligar), `max_amostras`, `vendedores_permitidos` (opcional), `varredura_token`, `max_por_varredura`, `modelo_ia`.
 
 RLS ligado em todas as tabelas, sem policies: só a service role acessa.
 
@@ -44,12 +46,16 @@ RLS ligado em todas as tabelas, sem policies: só a service role acessa.
 - Envio pela API (`send/text`) não gerou evento no webhook filtrado.
 - O agendamento nativo do Front (`scheduled-message`) só aceita TEMPLATE ou CHATBOT.
 
-## Próxima fase: varredura em modo sombra
+## Varredura em modo sombra (no ar desde 24/11)
 
-- Agendamento de hora em hora (pg_cron ou cron externo) que pega `proximo_followup_at <= now()` e `status = 'ativo'`.
-- Para cada lead: ler o histórico no Front, chamar a IA, gravar fase, checklist, resumo e decisão (`enviar` | `agendar` | `avisar_vendedor`) e a mensagem sugerida, **sem enviar** enquanto `envio_ligado = false`.
-- Regras: não empilhar mensagem se a última do vendedor não foi lida (`readContactAt` nulo); respeitar a janela de 24h (fora dela, só template); nunca prometer curso, modalidade, turma ou preço que não esteja na conversa ou na base de cursos.
-- Dependências pendentes: chave de API de IA (secret) e base oficial de cursos (curso, modalidade, períodos, EaD).
+- pg_cron `followup-varredura` (`5 11-22 * * 1-6` UTC = 8h05 às 19h05 em SP) chama `disparar_varredura()`, que faz POST na Edge Function `followup-varredura` com o header `x-varredura-token` (valor em `followup_config.varredura_token`).
+- `pegar_vencidos(limite)` reserva até `max_por_varredura` leads por 30 min; `registrar_analise(session, versao, jsonb)` grava em `followup_analises` e só aplica no lead se `atualizado_em` não mudou (senão `aplicada = false`).
+- Regras fixas antes da IA: lead falou por último → corrige estado; última mensagem nossa só SENT (não entregue) → espera 3h, e após 3 dias avisa o vendedor. **Leitura não conta** (a confirmação de leitura não é confiável).
+- IA: `followup_config.modelo_ia` (padrão `claude-opus-5-5`), saída JSON estruturada. Decisões: `enviar` | `agendar` | `avisar_vendedor` | `optout` (+ `aguardar` só por regra).
+- Régua fantasma: `enviar` avança `etapa_regua` (F2 no dia seguinte, F3 três dias depois, depois `repescagem`). Lead em repescagem volta a `ativo` quando alguém escreve.
+- **Nada é enviado**, mesmo com `envio_ligado = true`: o envio ainda não foi implementado.
+- Pendente: secrets `FRONT_API_TOKEN` e `ANTHROPIC_API_KEY` na função (sem eles ela responde 503) e a base oficial na tabela `cursos` (vazia).
+- Teste manual: `select public.disparar_varredura();` e depois `net._http_response`. Fora do horário comercial, a função só roda com `?forcar=1`.
 
 ## Convenções
 
@@ -62,6 +68,7 @@ RLS ligado em todas as tabelas, sem policies: só a service role acessa.
 ```bash
 supabase link --project-ref tkcshzndaztfykkraprp
 supabase functions deploy followup-webhook --no-verify-jwt
+supabase functions deploy followup-varredura --no-verify-jwt
 ```
 
 As migrações em `supabase/migrations` **já foram aplicadas** no banco. Num link novo, marque-as como aplicadas com `supabase migration repair --status applied <versão>` em vez de rodá-las de novo.
