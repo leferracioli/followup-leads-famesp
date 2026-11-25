@@ -36,6 +36,7 @@ type Lead = {
   ultima_msg_lead_at: string | null;
   ultima_msg_nossa_at: string | null;
   sessao_sync_em: string | null;
+  sessao_status: string | null;
 };
 
 // Dono atual da sessao e nome do contato, lidos do Front (o webhook nem sempre traz).
@@ -50,9 +51,11 @@ async function sincronizar(lead: Lead) {
   if (!sessao) return;
   lead.vendedor_id = sessao.userId ?? lead.vendedor_id;
   lead.lead_nome = sessao.title ?? lead.lead_nome;
+  lead.sessao_status = sessao.status ?? lead.sessao_status;
   await db.from("followup_leads").update({
     vendedor_id: lead.vendedor_id,
     lead_nome: lead.lead_nome,
+    sessao_status: lead.sessao_status,
     sessao_sync_em: new Date().toISOString(),
   }).eq("session_id", lead.session_id);
 }
@@ -77,7 +80,7 @@ Deno.serve(async (req: Request) => {
   const [{ data: leads, error }, { data: vendedores }] = await Promise.all([
     db.from("followup_leads")
       .select(
-        "session_id, lead_nome, vendedor_id, etiqueta_fup, etiqueta_desde, ultima_msg_lead_at, ultima_msg_nossa_at, sessao_sync_em",
+        "session_id, lead_nome, vendedor_id, etiqueta_fup, etiqueta_desde, ultima_msg_lead_at, ultima_msg_nossa_at, sessao_sync_em, sessao_status",
       )
       .not("etiqueta_fup", "is", null)
       .in("status", ["ativo", "repescagem"]),
@@ -96,6 +99,7 @@ Deno.serve(async (req: Request) => {
   const nomePainel = new Map((vendedores ?? []).map((v) => [v.front_user_id, v.nome_painel]));
   const grupos = new Map<string, { nome: string; total: number; por_etiqueta: Record<string, number>; leads: unknown[] }>();
   for (const l of lista) {
+    if (l.sessao_status === "COMPLETED") continue; // conversa encerrada no Front: sai do card
     const vendedor = (l.vendedor_id && nomePainel.get(l.vendedor_id)) || "Sem vendedor";
     if (filtro && vendedor !== filtro) continue;
     const g = grupos.get(vendedor) ?? { nome: vendedor, total: 0, por_etiqueta: {}, leads: [] };

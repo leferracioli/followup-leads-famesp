@@ -117,6 +117,18 @@ const doLead = (m: Msg) => m.direction === "FROM_HUB";
 //   BOT com template ou CAMPAIGN = follow-up automatico / campanha em massa
 const fluxoDoBot = (m: Msg) => !doLead(m) && m.origin === "BOT" && !m.templateId;
 const automacao = (m: Msg) => !doLead(m) && (m.origin === "CAMPAIGN" || (m.origin === "BOT" && !!m.templateId));
+// Resposta automatica do WhatsApp Business de quem recebeu a mensagem ("Agradecemos sua mensagem...").
+// Chega como mensagem do lead, mas nao e o lead falando.
+const AUTO_RESPOSTA =
+  /(mensagem autom[aá]tica|resposta autom[aá]tica|agradecemos (o seu |o |seu |sua |pelo |pela )?(contato|mensagem)|obrigad[oa] por entrar em contato|responderemos (assim|em breve|o mais)|retornaremos (assim|em breve|o mais|seu contato)|fora do hor[aá]rio de atendimento|nosso hor[aá]rio de atendimento)/i;
+const autoResposta = (m: Msg) =>
+  doLead(m) && typeof m.text === "string" && m.text.length >= 40 && AUTO_RESPOSTA.test(m.text);
+const doLeadReal = (m: Msg) => doLead(m) && !autoResposta(m);
+// Mensagem do lead que so encerra ou agradece, sem pedir nada ("ok", "obrigada", "certinho", emoji).
+const FECHAMENTO =
+  /^(ok+|okay|blz|beleza|certo|certinho+|combinado|t[aá] ?bom|(t[aá]|est[aá]) [oó]timo|[oó]timo|perfeito|show|valeu|obrigad[oa]s?|muito obrigad[oa]|grat[ao]|de nada|boa (noite|tarde)|bom dia|at[eé] mais|tchau|entendi|[\p{Extended_Pictographic}\s]+)([\s,.!]+(obrigad[oa]s?|viu|ta|t[aá]|ent[aã]o|[\p{Extended_Pictographic}]+))*[\s.!]*$/iu;
+const soFechamento = (m: Msg) =>
+  m.type === "STICKER" || (typeof m.text === "string" && m.text.trim().length <= 40 && FECHAMENTO.test(m.text.trim()));
 
 function textoDe(m: Msg) {
   const t = (m.text ?? "").trim();
@@ -131,7 +143,9 @@ function textoDe(m: Msg) {
 
 function transcrever(msgs: Msg[]) {
   return msgs.map((m) => {
-    const quem = doLead(m)
+    const quem = autoResposta(m)
+      ? "RESPOSTA AUTOMÁTICA DO CONTATO"
+      : doLead(m)
       ? "LEAD"
       : fluxoDoBot(m)
       ? "BOT"
@@ -170,7 +184,10 @@ A fase é o ponto MAIS AVANÇADO que a conversa já atingiu, mesmo que etapas an
   - "pendencia_nossa": o lead fez uma pergunta ou pedido que ninguém respondeu, ou ainda espera o primeiro atendimento humano. Decisão: avisar_vendedor, dizendo o que falta responder.
   - "sem_turma": o curso pedido não existe ou está sem turma aberta (no catálogo aparece como lista de espera ou sem turma), e nenhuma alternativa foi aceita. Decisão: avisar_vendedor ("colocar na lista de espera" ou "oferecer o curso X").
   - "sem_conversa": o lead só recebeu AUTOMAÇÃO e nunca conversou com um vendedor nem respondeu nada. Decisão: avisar_vendedor ("descubra o curso e faça o primeiro contato").
+  - "ja_matriculado": o lead já se matriculou (pagou a matrícula, recebeu boas-vindas, aguarda contrato ou início). Decisão: encerrar.
+  - "fora_do_funil": não é um lead de curso: aluno atual com assunto de secretaria ou financeiro, quem procura um serviço (atendimento, clínica, estética) e não um curso, engano, fornecedor ou spam. Decisão: encerrar, com alerta_vendedor dizendo para onde encaminhar, se for o caso.
   - "em_andamento": todos os outros casos.
+- RESPOSTA AUTOMÁTICA DO CONTATO não é o lead falando: ignore-a ao decidir quem falou por último.
 
 ## Régua
 - F1: primeira retomada. Retome o último ponto concreto da conversa e destrave o próximo passo da fase.
@@ -182,6 +199,7 @@ A fase é o ponto MAIS AVANÇADO que a conversa já atingiu, mesmo que etapas an
 - "agendar": o lead disse quando volta ("te falo amanhã", "depois do dia 5", "meu salário cai sexta"). Informe agendar_para (ISO 8601 com fuso -03:00) e não escreva mensagem.
 - "avisar_vendedor": situacao pendencia_nossa, sem_turma ou sem_conversa; não dá para identificar a fase; contexto sensível (reclamação, cancelamento, problema financeiro grave, luto, saúde); ou a objeção só se resolve com algo que não está na conversa nem na base (desconto novo, unidade em outra cidade). Escreva alerta_vendedor em uma frase dizendo o que o vendedor deve fazer.
 - "optout": o lead pediu para não ser mais contatado ou disse claramente que não tem interesse.
+- "encerrar": situacao ja_matriculado ou fora_do_funil. Não há follow-up comercial a fazer.
 
 ## Regras da mensagem (quando decisao = "enviar")
 - Português do Brasil, tom humano e acolhedor, como o próprio vendedor escreveria no WhatsApp. Nada de robótico, nada de "Prezado".
@@ -213,7 +231,10 @@ const FASES = ["encaixe", "apresentacao", "decisao", "inscricao"] as const;
 const OBJECOES = [
   "preco", "horario_rotina", "distancia_logistica", "concorrente", "terceiro_decide", "pre_requisito", "outra",
 ] as const;
-const SITUACOES = ["em_andamento", "pendencia_nossa", "sem_turma", "sem_conversa"] as const;
+const SITUACOES = [
+  "em_andamento", "pendencia_nossa", "sem_turma", "sem_conversa", "ja_matriculado", "fora_do_funil",
+] as const;
+const DECISOES = ["enviar", "agendar", "avisar_vendedor", "optout", "encerrar"] as const;
 
 const SCHEMA = {
   type: "object",
@@ -233,7 +254,7 @@ const SCHEMA = {
     objecao: { anyOf: [{ type: "string", enum: OBJECOES }, { type: "null" }] },
     situacao: { type: "string", enum: SITUACOES },
     resumo: { type: "string" },
-    decisao: { type: "string", enum: ["enviar", "agendar", "avisar_vendedor", "optout"] },
+    decisao: { type: "string", enum: DECISOES },
     motivo: { type: "string", description: "Uma frase explicando a decisão." },
     mensagem: { type: ["string", "null"], description: "Só quando decisao = enviar." },
     horarios_oferecidos: { type: "array", items: { type: "string" } },
@@ -248,7 +269,7 @@ type Saida = {
   objecao: (typeof OBJECOES)[number] | null;
   situacao: (typeof SITUACOES)[number];
   resumo: string;
-  decisao: "enviar" | "agendar" | "avisar_vendedor" | "optout";
+  decisao: (typeof DECISOES)[number];
   motivo: string;
   mensagem: string | null;
   horarios_oferecidos: string[];
@@ -337,6 +358,43 @@ async function chamarOpenAI(corpo: Record<string, unknown>): Promise<Msg> {
   }
 }
 
+// Transcreve os audios recentes do lead que o Front nao transcreveu (ate 3, so os ultimos 15 itens).
+// Grava em details.transcription, que transcrever() ja usa. Falha aqui nao impede a analise.
+async function transcreverAudios(msgs: Msg[], cfg: Record<string, string>) {
+  const alvos = msgs.slice(-15).filter((m) =>
+    doLead(m) && m.type === "AUDIO" && !m.details?.transcription && m.details?.file?.publicUrl &&
+    (m.details.file.size ?? 0) < 20_000_000
+  ).slice(-3);
+  for (const m of alvos) {
+    try {
+      const audio = await fetch(m.details.file.publicUrl);
+      if (!audio.ok) continue;
+      const arquivo = new File([await audio.arrayBuffer()], m.details.file.name ?? "audio.mp3", {
+        type: m.details.file.mimeType ?? "audio/mpeg",
+      });
+      for (const modelo of [cfg.modelo_transcricao || "gpt-4o-transcribe", "whisper-1"]) {
+        const form = new FormData();
+        form.append("file", arquivo);
+        form.append("model", modelo);
+        form.append("language", "pt");
+        const r = await fetch(`${OPENAI_API}/audio/transcriptions`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${OPENAI_KEY}` },
+          body: form,
+        });
+        if (r.ok) {
+          const texto = (await r.json())?.text;
+          if (texto) m.details = { ...m.details, transcription: String(texto).slice(0, 1500) };
+          break;
+        }
+        if (r.status !== 400 && r.status !== 404) break; // so tenta o modelo reserva se o modelo nao existir
+      }
+    } catch (e) {
+      console.error("transcricao", m.id, e);
+    }
+  }
+}
+
 // ---------- processamento de um lead ----------
 
 async function registrar(lead: Lead, p: Record<string, unknown>) {
@@ -370,6 +428,7 @@ const ETIQUETAS: Record<string, { nome: string; cor: string }> = {
 //   undefined = nao mexe (espera de regra: automacao recente, mensagem nao entregue, falha da IA)
 function etiquetaDesejada(p: Record<string, unknown>): string | null | undefined {
   if (p.decisao === "avisar_vendedor") return (ETIQUETAS[String(p.situacao)] ?? ETIQUETAS.outro).nome;
+  if (p.decisao === "encerrar") return null;
   if (p.origem === "ia" && ["enviar", "agendar", "optout"].includes(String(p.decisao))) return null;
   if (p.lead_falou_por_ultimo) return null;
   return undefined;
@@ -477,10 +536,11 @@ async function avisarVendedor(lead: Lead, p: Record<string, unknown>) {
 // ---------- regras fixas (antes da IA) ----------
 
 function contexto(msgs: Msg[]) {
-  // O fluxo do bot (menu, "um consultor vai te atender") nao conta como quem falou por ultimo.
-  const conversa = msgs.filter((m) => !fluxoDoBot(m));
+  // O fluxo do bot (menu, "um consultor vai te atender") e a resposta automatica do contato
+  // nao contam como quem falou por ultimo.
+  const conversa = msgs.filter((m) => !fluxoDoBot(m) && !autoResposta(m));
   const ultima = conversa[conversa.length - 1] ?? msgs[msgs.length - 1];
-  const ultLead = [...msgs].reverse().find(doLead);
+  const ultLead = [...msgs].reverse().find(doLeadReal);
   const ultNossa = [...conversa].reverse().find((m) => !doLead(m));
   const dentroJanela = !!ultLead && Date.now() - quando(ultLead) < JANELA_24H_MS;
   // A confirmacao de leitura nao e confiavel (lead responde mensagem "nao lida").
@@ -490,16 +550,54 @@ function contexto(msgs: Msg[]) {
   return { conversa, ultima, ultLead, ultNossa, dentroJanela, nossaEntregue };
 }
 
-// Devolve a analise de regra (sem IA), ou null quando o lead deve ir para a IA.
-function regraFixa(msgs: Msg[]): Record<string, unknown> | null {
-  const { conversa, ultima, ultLead, ultNossa, dentroJanela, nossaEntregue } = contexto(msgs);
+const HORA_MS = 3600_000;
+function tempoDesde(t: number) {
+  const h = Math.round((Date.now() - t) / HORA_MS);
+  return h < 1 ? "há menos de 1 hora" : h < 48 ? `há ${h} h` : `há ${Math.round(h / 24)} dias`;
+}
 
-  // Regra 1: o lead falou por ultimo (o webhook perdeu o evento). A bola esta com o vendedor.
-  if (doLead(ultima)) {
+// Devolve a analise de regra (sem IA), ou null quando o lead deve ir para a IA.
+function regraFixa(msgs: Msg[], cfg: Record<string, string>): Record<string, unknown> | null {
+  const { conversa, ultima, ultLead, ultNossa, dentroJanela, nossaEntregue } = contexto(msgs);
+  const vendedorHumano = (m: Msg) => !doLead(m) && !fluxoDoBot(m) && !automacao(m);
+
+  // Regra 0: lead frio. O lead nao escreve ha mais de N dias e nenhum vendedor falou com ele nesse
+  // tempo (so campanha ou regua automatica). Sai do follow-up; volta a ativo se escrever.
+  const limiteFrio = (Number(cfg.dias_max_sem_lead ?? 60) || 60) * 24 * HORA_MS;
+  if (ultLead && Date.now() - quando(ultLead) > limiteFrio &&
+    !msgs.some((m) => vendedorHumano(m) && Date.now() - quando(m) <= limiteFrio)) {
     return {
-      origem: "regra", decisao: "aguardar", lead_falou_por_ultimo: true, proximo_followup_at: null,
-      motivo: "No Front, a última mensagem é do lead: cabe ao vendedor responder.",
+      origem: "regra", decisao: "encerrar", situacao: "lead_frio", dentro_janela_24h: false,
+      motivo: `Lead não escreve ${tempoDesde(quando(ultLead))} e ninguém conversou com ele nesse período: fora do follow-up.`,
+    };
+  }
+
+  // Regra 1: o lead falou por ultimo. A bola esta com o vendedor.
+  if (doLeadReal(ultima)) {
+    // Ainda dentro da primeira hora: espera o vendedor responder.
+    if (Date.now() - quando(ultima) < HORA_MS) {
+      return {
+        origem: "regra", decisao: "aguardar", dentro_janela_24h: dentroJanela,
+        proximo_followup_at: new Date(quando(ultima) + HORA_MS).toISOString(),
+        motivo: "O lead acabou de escrever: aguardando a resposta do vendedor.",
+      };
+    }
+    // So agradeceu ou encerrou ("ok", "obrigada"): nada a responder.
+    const doLeadDepois = conversa.filter((m) => doLeadReal(m) && (!ultNossa || quando(m) > quando(ultNossa)));
+    if (doLeadDepois.length && doLeadDepois.every(soFechamento)) {
+      return {
+        origem: "regra", decisao: "aguardar", lead_falou_por_ultimo: true, proximo_followup_at: null,
+        motivo: "O lead só agradeceu ou encerrou a conversa: nada pendente para responder.",
+        dentro_janela_24h: dentroJanela,
+      };
+    }
+    // Lead esperando resposta: pendencia nossa.
+    const trecho = textoDe(ultima).replace(/\s+/g, " ").slice(0, 120);
+    return {
+      origem: "regra", decisao: "avisar_vendedor", situacao: "pendencia_nossa", lead_falou_por_ultimo: true,
       dentro_janela_24h: dentroJanela,
+      motivo: "O lead escreveu e ainda não teve resposta.",
+      alerta_vendedor: `O lead escreveu ${tempoDesde(quando(ultima))} e está esperando resposta: "${trecho}"`,
     };
   }
 
@@ -516,7 +614,7 @@ function regraFixa(msgs: Msg[]): Record<string, unknown> | null {
 
   // Regra 3: lead que so recebeu automacao e nunca conversou (nem escreveu, nem falou com vendedor).
   // Nao ha conversa para retomar: falta o primeiro contato humano. Nao gasta IA.
-  const vendedorFalou = msgs.some((m) => !doLead(m) && !fluxoDoBot(m) && !automacao(m));
+  const vendedorFalou = msgs.some(vendedorHumano);
   if (!ultLead && !vendedorFalou) {
     return {
       origem: "regra", decisao: "avisar_vendedor", situacao: "sem_conversa", dentro_janela_24h: false,
@@ -569,7 +667,7 @@ async function lerSessao(lote: string, s: SessaoLeitura, cfg: Record<string, str
       motivo: "Sessão sem mensagens no Front." });
     return;
   }
-  const regra = regraFixa(msgs);
+  const regra = regraFixa(msgs, cfg);
   if (regra) {
     await db.from("followup_leituras").insert({
       ...base, ...datas, origem: "regra", decisao: regra.decisao, motivo: regra.motivo,
@@ -585,6 +683,7 @@ async function lerSessao(lote: string, s: SessaoLeitura, cfg: Record<string, str
     etiqueta_fup: null,
   } as Lead;
   try {
+    await transcreverAudios(msgs, cfg);
     const cursos = catalogo.length ? blocoCatalogo(catalogo, transcrever(msgs)) : "";
     const r = await analisarComIA(leadNovo, msgs, {
       etapa: 1, dentroJanela, cursos, modelo: cfg.modelo_ia || MODELO_PADRAO,
@@ -594,7 +693,7 @@ async function lerSessao(lote: string, s: SessaoLeitura, cfg: Record<string, str
       ...base, ...datas, origem: "ia", decisao: x.decisao, motivo: x.motivo, fase: x.fase, situacao: x.situacao,
       objecao: x.objecao, resumo: x.resumo?.slice(0, 300), checklist: x.checklist,
       mensagem_sugerida: x.decisao === "enviar" ? x.mensagem : null,
-      alerta_vendedor: x.decisao === "avisar_vendedor" ? x.alerta_vendedor : null,
+      alerta_vendedor: ["avisar_vendedor", "encerrar"].includes(x.decisao) ? x.alerta_vendedor : null,
       dentro_janela_24h: dentroJanela, modelo: r.modelo, tokens_entrada: r.tokensEntrada, tokens_saida: r.tokensSaida,
     });
   } catch (e) {
@@ -632,7 +731,7 @@ async function processarLead(lead: Lead, cfg: Record<string, string>, catalogo: 
   }
 
   const { dentroJanela } = contexto(msgs);
-  const regra = regraFixa(msgs);
+  const regra = regraFixa(msgs, cfg);
   if (regra) {
     await registrar(lead, regra);
     return;
@@ -640,6 +739,7 @@ async function processarLead(lead: Lead, cfg: Record<string, string>, catalogo: 
 
   try {
     // Só o detalhe dos cursos citados na conversa (e a lista de nomes) vai para a IA.
+    await transcreverAudios(msgs, cfg);
     const cursos = catalogo.length ? blocoCatalogo(catalogo, transcrever(msgs)) : "";
     const r = await analisarComIA(lead, msgs, {
       etapa, dentroJanela, cursos, modelo: cfg.modelo_ia || MODELO_PADRAO,
@@ -660,7 +760,7 @@ async function processarLead(lead: Lead, cfg: Record<string, string>, catalogo: 
       mensagem_sugerida: s.decisao === "enviar" ? s.mensagem : null,
       horarios_oferecidos: s.decisao === "enviar" ? s.horarios_oferecidos : null,
       agendar_para: s.decisao === "agendar" ? s.agendar_para : null,
-      alerta_vendedor: s.decisao === "avisar_vendedor" ? s.alerta_vendedor : null,
+      alerta_vendedor: ["avisar_vendedor", "encerrar"].includes(s.decisao) ? s.alerta_vendedor : null,
       dentro_janela_24h: dentroJanela,
       ultima_nossa_entregue: true,
       modelo: r.modelo,
