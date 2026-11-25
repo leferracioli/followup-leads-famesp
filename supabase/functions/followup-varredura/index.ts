@@ -420,15 +420,19 @@ const ETIQUETAS: Record<string, { nome: string; cor: string }> = {
   sem_conversa: { nome: "FUP - Primeiro contato", cor: "YELLOW_500" },
   sem_turma: { nome: "FUP - Sem turma", cor: "PURPLE_400" },
   outro: { nome: "FUP - Ver conversa", cor: "BLUE_400" },
+  // Encerramentos: o lead sai do follow-up (e do card), mas fica marcado no Front para filtro.
+  ja_matriculado: { nome: "FUP - Matriculado", cor: "GREEN_400" },
+  fora_do_funil: { nome: "FUP - Fora do funil", cor: "GRAY_400" },
+  lead_frio: { nome: "FUP - Lead frio", cor: "SKY_400" },
 };
 
 // Qual etiqueta o lead deve ter depois desta analise.
-//   string    = esta etiqueta
-//   null      = nenhuma (a conversa andou: IA mandou enviar/agendar/optout, ou o lead falou por ultimo)
+//   string    = esta etiqueta (aviso ao vendedor ou encerramento: matriculado, fora do funil, lead frio)
+//   null      = nenhuma (a conversa andou: IA mandou enviar/agendar/optout, ou o lead so agradeceu)
 //   undefined = nao mexe (espera de regra: automacao recente, mensagem nao entregue, falha da IA)
 function etiquetaDesejada(p: Record<string, unknown>): string | null | undefined {
   if (p.decisao === "avisar_vendedor") return (ETIQUETAS[String(p.situacao)] ?? ETIQUETAS.outro).nome;
-  if (p.decisao === "encerrar") return null;
+  if (p.decisao === "encerrar") return ETIQUETAS[String(p.situacao)]?.nome ?? null;
   if (p.origem === "ia" && ["enviar", "agendar", "optout"].includes(String(p.decisao))) return null;
   if (p.lead_falou_por_ultimo) return null;
   return undefined;
