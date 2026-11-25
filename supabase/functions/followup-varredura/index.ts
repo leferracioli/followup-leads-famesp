@@ -12,6 +12,7 @@ import { createClient } from "jsr:@supabase/supabase-js@2";
 declare const EdgeRuntime: { waitUntil(p: Promise<unknown>): void } | undefined;
 
 const FRONT_API = Deno.env.get("FRONT_API_BASE") ?? "https://api.wts.chat/chat";
+const FRONT_CORE = Deno.env.get("FRONT_CORE_BASE") ?? "https://api.wts.chat/core"; // contatos e etiquetas
 const FRONT_TOKEN = Deno.env.get("FRONT_API_TOKEN") ?? "";
 const OPENAI_KEY = Deno.env.get("OPENAI_API_KEY") ?? "";
 const OPENAI_API = Deno.env.get("OPENAI_API_BASE") ?? "https://api.openai.com/v1";
@@ -39,6 +40,7 @@ type Lead = {
   atualizado_em: string;
   ultima_msg_lead_at: string | null;
   ultimo_aviso_at: string | null;
+  etiqueta_fup: string | null;
 };
 
 // Config da varredura em curso (lida no inicio de cada chamada).
@@ -71,21 +73,22 @@ function fmtLocal(d: Date) {
 
 // ---------- Front ----------
 
-async function front(path: string): Promise<Msg> {
-  const r = await fetch(`${FRONT_API}${path}`, {
+async function front(path: string, base = FRONT_API): Promise<Msg> {
+  const r = await fetch(`${base}${path}`, {
     headers: { Authorization: `Bearer ${FRONT_TOKEN}`, Accept: "application/json" },
   });
   if (!r.ok) throw new Error(`Front ${r.status} em ${path}: ${(await r.text()).slice(0, 200)}`);
   return await r.json();
 }
 
-async function frontPost(path: string, corpo: unknown): Promise<void> {
-  const r = await fetch(`${FRONT_API}${path}`, {
+async function frontPost(path: string, corpo: unknown, base = FRONT_API): Promise<Msg | null> {
+  const r = await fetch(`${base}${path}`, {
     method: "POST",
     headers: { Authorization: `Bearer ${FRONT_TOKEN}`, "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify(corpo),
   });
   if (!r.ok) throw new Error(`Front ${r.status} em ${path}: ${(await r.text()).slice(0, 200)}`);
+  return await r.json().catch(() => null);
 }
 
 // Ultimas mensagens da sessao, da mais antiga para a mais nova.
@@ -341,9 +344,86 @@ async function registrar(lead: Lead, p: Record<string, unknown>) {
     p: { modo: "sombra", ...p },
   });
   if (error) console.error("registrar_analise", lead.session_id, error);
-  // So avisa se a analise valeu (o lead nao mudou durante a analise).
-  if (!error && aplicada === true && p.decisao === "avisar_vendedor") {
+  // So avisa e mexe em etiqueta se a analise valeu (o lead nao mudou durante a analise).
+  if (error || aplicada !== true) return;
+  if (p.decisao === "avisar_vendedor") {
     await avisarVendedor(lead, p).catch((e) => console.error("aviso", lead.session_id, e));
+  }
+  await ajustarEtiqueta(lead, p).catch((e) => console.error("etiqueta", lead.session_id, e));
+}
+
+// ---------- aviso ao vendedor: etiqueta no contato do Front ----------
+// Uma etiqueta "FUP - ..." por lead, dizendo o que o vendedor precisa fazer.
+
+const ETIQUETAS: Record<string, { nome: string; cor: string }> = {
+  pendencia_nossa: { nome: "FUP - Responder lead", cor: "RED_400" },
+  sem_conversa: { nome: "FUP - Primeiro contato", cor: "YELLOW_500" },
+  sem_turma: { nome: "FUP - Sem turma", cor: "PURPLE_400" },
+  outro: { nome: "FUP - Ver conversa", cor: "BLUE_400" },
+};
+
+// Qual etiqueta o lead deve ter depois desta analise.
+//   string    = esta etiqueta
+//   null      = nenhuma (a conversa andou: IA mandou enviar/agendar/optout, ou o lead falou por ultimo)
+//   undefined = nao mexe (espera de regra: automacao recente, mensagem nao entregue, falha da IA)
+function etiquetaDesejada(p: Record<string, unknown>): string | null | undefined {
+  if (p.decisao === "avisar_vendedor") return (ETIQUETAS[String(p.situacao)] ?? ETIQUETAS.outro).nome;
+  if (p.origem === "ia" && ["enviar", "agendar", "optout"].includes(String(p.decisao))) return null;
+  if (p.lead_falou_por_ultimo) return null;
+  return undefined;
+}
+
+// Guarda a promessa (e nao o resultado) para os 4 trabalhadores nao criarem a mesma etiqueta em paralelo.
+let idsEtiquetas: Promise<Map<string, string>> | null = null;
+function etiquetasFUP(): Promise<Map<string, string>> {
+  idsEtiquetas ??= carregarEtiquetasFUP().catch((e) => {
+    idsEtiquetas = null;
+    throw e;
+  });
+  return idsEtiquetas;
+}
+
+// Ids das etiquetas FUP no Front; cria as que faltam (uma vez por varredura).
+async function carregarEtiquetasFUP(): Promise<Map<string, string>> {
+  const r = await front("/v1/tag", FRONT_CORE);
+  const todas: Msg[] = Array.isArray(r) ? r : (r.items ?? r.data ?? []);
+  const mapa = new Map<string, string>();
+  for (const { nome, cor } of Object.values(ETIQUETAS)) {
+    const existente = todas.find((t) => t.name === nome);
+    const id = existente?.id ?? (await frontPost("/v1/tag", { name: nome, color: cor }, FRONT_CORE))?.id;
+    if (id) mapa.set(nome, id);
+  }
+  return mapa;
+}
+
+async function ajustarEtiqueta(lead: Lead, p: Record<string, unknown>) {
+  const desejada = etiquetaDesejada(p);
+  if (desejada === undefined || desejada === (lead.etiqueta_fup ?? null)) return;
+  const marcar = (etiqueta: string | null, status: string) =>
+    db.rpc("registrar_etiqueta", { p_session_id: lead.session_id, p_etiqueta: etiqueta, p_status: status });
+
+  if (config.etiqueta_ligada !== "true") return void await marcar(desejada, "desligada");
+
+  try {
+    const sessao = await front(`/v2/session/${lead.session_id}`);
+    const contato = sessao.contactId ?? sessao.data?.contactId;
+    if (!contato) throw new Error("sessão sem contactId");
+    const ids = await etiquetasFUP();
+    // Insere/remove so a etiqueta FUP: as etiquetas das reguas do time ficam intactas.
+    if (lead.etiqueta_fup && ids.get(lead.etiqueta_fup)) {
+      await frontPost(`/v1/contact/${contato}/tags`, {
+        tagIds: [ids.get(lead.etiqueta_fup)], operation: "DeleteIfExists",
+      }, FRONT_CORE);
+    }
+    if (desejada) {
+      const id = ids.get(desejada);
+      if (!id) throw new Error(`etiqueta ${desejada} não encontrada no Front`);
+      await frontPost(`/v1/contact/${contato}/tags`, { tagIds: [id], operation: "InsertIfNotExists" }, FRONT_CORE);
+    }
+    await marcar(desejada, desejada ? "aplicada" : "removida");
+  } catch (e) {
+    console.error("etiqueta", lead.session_id, e);
+    await marcar(desejada, "erro");
   }
 }
 
@@ -526,6 +606,7 @@ async function baseDeCursos(): Promise<string> {
 
 async function varrer(cfg: Record<string, string>) {
   config = cfg;
+  idsEtiquetas = null; // relê as etiquetas do Front a cada varredura
   const limite = Number(cfg.max_por_varredura ?? 30) || 30;
   const { data: leads, error } = await db.rpc("pegar_vencidos", { p_limite: limite });
   if (error) throw error;

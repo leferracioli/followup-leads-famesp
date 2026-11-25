@@ -42,7 +42,7 @@ Todo follow-up termina oferecendo **dois horários** para o retorno.
 - `webhook_amostras`: os primeiros 30 payloads de mensagem, para mapear o formato.
 - `followup_analises`: uma linha por análise da varredura (retenção de 90 dias).
 - `cursos`: base oficial de cursos que a IA pode citar (vazia por enquanto).
-- `followup_config`: `webhook_token`, `envio_ligado` (botão de desligar), `max_amostras`, `vendedores_permitidos` (opcional), `varredura_token`, `max_por_varredura`, `modelo_ia`, `aviso_nota_ligado`, `aviso_repetir_dias`.
+- `followup_config`: `webhook_token`, `envio_ligado` (botão de desligar), `max_amostras`, `vendedores_permitidos` (opcional), `varredura_token`, `max_por_varredura`, `modelo_ia`, `aviso_nota_ligado`, `aviso_repetir_dias`, `etiqueta_ligada`.
 
 RLS ligado em todas as tabelas, sem policies: só a service role acessa.
 
@@ -70,7 +70,8 @@ RLS ligado em todas as tabelas, sem policies: só a service role acessa.
 - Régua fantasma: `enviar` avança `etapa_regua` (F2 no dia seguinte, F3 três dias depois, depois `repescagem`). Lead em repescagem volta a `ativo` quando alguém escreve.
 - **Nada é enviado ao lead**, mesmo com `envio_ligado = true`: o envio ainda não foi implementado.
 - **Aviso ao vendedor (no ar desde 25/11):** quando a decisão é `avisar_vendedor` e a análise foi aplicada, a varredura posta uma **nota interna** na conversa do Front (`POST /v1/session/{id}/note`; o lead não vê). A nota sai no nome do dono do token da API. Chave `followup_config.aviso_nota_ligado`. Não repete antes de `aviso_repetir_dias` (3), a não ser que o lead tenha escrito depois do último aviso. O resultado fica em `followup_analises.aviso_nota` (postada, repetida, desligada, erro) e em `followup_leads.ultimo_aviso_at/ultimo_aviso_texto`. A nota não aparece na lista de mensagens nem dispara o webhook.
-- Próximos canais de aviso combinados: etiqueta no contato (2) e resumo diário (3).
+- **Etiqueta no contato (no ar desde 25/11):** cada lead tem no máximo uma etiqueta `FUP - …` no contato do Front (API core: `POST https://api.wts.chat/core/v1/contact/{contactId}/tags` com `InsertIfNotExists` / `DeleteIfExists`, **nunca `ReplaceAll`**: as réguas do time dependem das próprias etiquetas, como `ABANDONO_ROBO`). Os nomes são: `FUP - Responder lead` (pendencia_nossa), `FUP - Primeiro contato` (sem_conversa), `FUP - Sem turma` e `FUP - Ver conversa` (outros avisos). Sai quando a IA decide enviar, agendar ou optout, ou quando o lead fala por último. Esperas de regra não mexem nela. A varredura cria a etiqueta no Front se ela faltar. Chave `followup_config.etiqueta_ligada`. Estado em `followup_leads.etiqueta_fup` e `followup_analises.etiqueta`.
+- Próximo canal de aviso combinado: resumo diário (3).
 - Secrets `FRONT_API_TOKEN` e `OPENAI_API_KEY` cadastrados em 25/11 (sem eles a função responde 503). Primeiro teste real no mesmo dia: 24 leads, sem erro.
 - Pendente: a base oficial na tabela `cursos` (vazia).
 - Teste manual: `select public.disparar_varredura();` e depois `net._http_response`. Fora do horário comercial, a função só roda com `?forcar=1`.
