@@ -71,7 +71,7 @@ RLS ligado em todas as tabelas, sem policies: só a service role acessa.
 - **Nada é enviado ao lead**, mesmo com `envio_ligado = true`: o envio ainda não foi implementado.
 - **Aviso ao vendedor (no ar desde 25/11):** quando a decisão é `avisar_vendedor` e a análise foi aplicada, a varredura posta uma **nota interna** na conversa do Front (`POST /v1/session/{id}/note`; o lead não vê). A nota sai no nome do dono do token da API. Chave `followup_config.aviso_nota_ligado`. Não repete antes de `aviso_repetir_dias` (3), a não ser que o lead tenha escrito depois do último aviso. O resultado fica em `followup_analises.aviso_nota` (postada, repetida, desligada, erro) e em `followup_leads.ultimo_aviso_at/ultimo_aviso_texto`. A nota não aparece na lista de mensagens nem dispara o webhook.
 - **Etiqueta no contato (no ar desde 25/11):** cada lead tem no máximo uma etiqueta `FUP - …` no contato do Front (API core: `POST https://api.wts.chat/core/v1/contact/{contactId}/tags` com `InsertIfNotExists` / `DeleteIfExists`, **nunca `ReplaceAll`**: as réguas do time dependem das próprias etiquetas, como `ABANDONO_ROBO`). Os nomes são: `FUP - Responder lead` (pendencia_nossa), `FUP - Primeiro contato` (sem_conversa), `FUP - Sem turma` e `FUP - Ver conversa` (outros avisos). Sai quando a IA decide enviar, agendar ou optout, ou quando o lead fala por último. Esperas de regra não mexem nela. A varredura cria a etiqueta no Front se ela faltar. Chave `followup_config.etiqueta_ligada`. Estado em `followup_leads.etiqueta_fup` e `followup_analises.etiqueta`.
-- Próximo canal de aviso combinado: resumo diário (3).
+- **Card no painel comercial (3, pronto, ainda não publicado):** o painel `painel-comercial-famesp.vercel.app` é outro projeto (pasta `Treinamento Comercial - Famesp`, HTML estático no Vercel, sem remoto git). Ele lê do FAMESP Comercial, mas o card de follow-up lê da Edge Function **`followup-painel`** deste projeto (`GET ?vendedor=<nome no painel>` ou `?todos=1`, header `x-painel-key` = `followup_config.painel_key`). Como o painel é público, a função devolve só primeiro nome, etiqueta, datas e o link do Front. A tabela `vendedores` faz o de-para entre usuário do Front e nome no painel. O dono e o nome da sessão são relidos do Front a cada 15 min (`sessao_sync_em`). Deploy: `supabase functions deploy followup-painel --no-verify-jwt`.
 - Secrets `FRONT_API_TOKEN` e `OPENAI_API_KEY` cadastrados em 25/11 (sem eles a função responde 503). Primeiro teste real no mesmo dia: 24 leads, sem erro.
 - Pendente: a base oficial na tabela `cursos` (vazia).
 - Teste manual: `select public.disparar_varredura();` e depois `net._http_response`. Fora do horário comercial, a função só roda com `?forcar=1`.
@@ -88,6 +88,7 @@ RLS ligado em todas as tabelas, sem policies: só a service role acessa.
 supabase link --project-ref tkcshzndaztfykkraprp
 supabase functions deploy followup-webhook --no-verify-jwt
 supabase functions deploy followup-varredura --no-verify-jwt
+supabase functions deploy followup-painel --no-verify-jwt
 ```
 
 As migrações em `supabase/migrations` **já foram aplicadas** no banco. Num link novo, marque-as como aplicadas com `supabase migration repair --status applied <versão>` em vez de rodá-las de novo.
