@@ -37,7 +37,12 @@ type Lead = {
   resumo: string | null;
   etapa_regua: number;
   atualizado_em: string;
+  ultima_msg_lead_at: string | null;
+  ultimo_aviso_at: string | null;
 };
+
+// Config da varredura em curso (lida no inicio de cada chamada).
+let config: Record<string, string> = {};
 
 // deno-lint-ignore no-explicit-any
 type Msg = Record<string, any>;
@@ -72,6 +77,15 @@ async function front(path: string): Promise<Msg> {
   });
   if (!r.ok) throw new Error(`Front ${r.status} em ${path}: ${(await r.text()).slice(0, 200)}`);
   return await r.json();
+}
+
+async function frontPost(path: string, corpo: unknown): Promise<void> {
+  const r = await fetch(`${FRONT_API}${path}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${FRONT_TOKEN}`, "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify(corpo),
+  });
+  if (!r.ok) throw new Error(`Front ${r.status} em ${path}: ${(await r.text()).slice(0, 200)}`);
 }
 
 // Ultimas mensagens da sessao, da mais antiga para a mais nova.
@@ -321,12 +335,61 @@ async function chamarOpenAI(corpo: Record<string, unknown>): Promise<Msg> {
 // ---------- processamento de um lead ----------
 
 async function registrar(lead: Lead, p: Record<string, unknown>) {
-  const { error } = await db.rpc("registrar_analise", {
+  const { data: aplicada, error } = await db.rpc("registrar_analise", {
     p_session_id: lead.session_id,
     p_versao: lead.atualizado_em,
     p: { modo: "sombra", ...p },
   });
   if (error) console.error("registrar_analise", lead.session_id, error);
+  // So avisa se a analise valeu (o lead nao mudou durante a analise).
+  if (!error && aplicada === true && p.decisao === "avisar_vendedor") {
+    await avisarVendedor(lead, p).catch((e) => console.error("aviso", lead.session_id, e));
+  }
+}
+
+// ---------- aviso ao vendedor: nota interna na conversa do Front ----------
+
+const SITUACAO_TEXTO: Record<string, string> = {
+  pendencia_nossa: "lead esperando resposta nossa",
+  sem_turma: "curso sem turma aberta",
+  sem_conversa: "só recebeu automação, nunca conversou",
+};
+
+function montarNota(p: Record<string, unknown>) {
+  const linhas = [`🔔 Follow-up automático: ação do vendedor`, String(p.alerta_vendedor ?? p.motivo ?? "")];
+  const detalhes = [
+    p.situacao && SITUACAO_TEXTO[String(p.situacao)] && `Situação: ${SITUACAO_TEXTO[String(p.situacao)]}`,
+    p.fase && `Fase: ${p.fase}`,
+    p.objecao && `Objeção: ${p.objecao}`,
+  ].filter(Boolean);
+  if (detalhes.length) linhas.push(detalhes.join(" · "));
+  if (p.resumo) linhas.push(`Resumo: ${p.resumo}`);
+  linhas.push("(Nota da varredura de follow-up. O lead não vê esta nota.)");
+  return linhas.join("\n");
+}
+
+async function avisarVendedor(lead: Lead, p: Record<string, unknown>) {
+  const marcar = (status: string, texto?: string) =>
+    db.rpc("registrar_aviso", { p_session_id: lead.session_id, p_status: status, p_texto: texto ?? null });
+
+  if (config.aviso_nota_ligado !== "true") return void await marcar("desligada");
+
+  // Nao repete: so avisa de novo depois de N dias, ou se o lead escreveu depois do ultimo aviso.
+  const dias = Number(config.aviso_repetir_dias ?? 3) || 3;
+  if (lead.ultimo_aviso_at) {
+    const ultimo = new Date(lead.ultimo_aviso_at).getTime();
+    const leadEscreveuDepois = !!lead.ultima_msg_lead_at && new Date(lead.ultima_msg_lead_at).getTime() > ultimo;
+    if (Date.now() - ultimo < dias * 24 * 3600_000 && !leadEscreveuDepois) return void await marcar("repetida");
+  }
+
+  const texto = montarNota(p);
+  try {
+    await frontPost(`/v1/session/${lead.session_id}/note`, { text: texto });
+    await marcar("postada", texto);
+  } catch (e) {
+    console.error("nota", lead.session_id, e);
+    await marcar("erro");
+  }
 }
 
 async function processarLead(lead: Lead, cfg: Record<string, string>, cursos: string) {
@@ -462,6 +525,7 @@ async function baseDeCursos(): Promise<string> {
 }
 
 async function varrer(cfg: Record<string, string>) {
+  config = cfg;
   const limite = Number(cfg.max_por_varredura ?? 30) || 30;
   const { data: leads, error } = await db.rpc("pegar_vencidos", { p_limite: limite });
   if (error) throw error;

@@ -42,7 +42,7 @@ Todo follow-up termina oferecendo **dois horários** para o retorno.
 - `webhook_amostras`: os primeiros 30 payloads de mensagem, para mapear o formato.
 - `followup_analises`: uma linha por análise da varredura (retenção de 90 dias).
 - `cursos`: base oficial de cursos que a IA pode citar (vazia por enquanto).
-- `followup_config`: `webhook_token`, `envio_ligado` (botão de desligar), `max_amostras`, `vendedores_permitidos` (opcional), `varredura_token`, `max_por_varredura`, `modelo_ia`.
+- `followup_config`: `webhook_token`, `envio_ligado` (botão de desligar), `max_amostras`, `vendedores_permitidos` (opcional), `varredura_token`, `max_por_varredura`, `modelo_ia`, `aviso_nota_ligado`, `aviso_repetir_dias`.
 
 RLS ligado em todas as tabelas, sem policies: só a service role acessa.
 
@@ -68,7 +68,9 @@ RLS ligado em todas as tabelas, sem policies: só a service role acessa.
 - **Leitura não conta**: a confirmação de leitura não é confiável.
 - IA: **OpenAI** (Chat Completions com Structured Outputs `strict`, chamada por `fetch`), modelo em `followup_config.modelo_ia` (padrão `gpt-5.6`), `reasoning_effort` medium. Trocada da Anthropic em 25/11 por escolha da Letícia. Decisões: `enviar` | `agendar` | `avisar_vendedor` | `optout` (+ `aguardar` só por regra).
 - Régua fantasma: `enviar` avança `etapa_regua` (F2 no dia seguinte, F3 três dias depois, depois `repescagem`). Lead em repescagem volta a `ativo` quando alguém escreve.
-- **Nada é enviado**, mesmo com `envio_ligado = true`: o envio ainda não foi implementado.
+- **Nada é enviado ao lead**, mesmo com `envio_ligado = true`: o envio ainda não foi implementado.
+- **Aviso ao vendedor (no ar desde 25/11):** quando a decisão é `avisar_vendedor` e a análise foi aplicada, a varredura posta uma **nota interna** na conversa do Front (`POST /v1/session/{id}/note`; o lead não vê). A nota sai no nome do dono do token da API. Chave `followup_config.aviso_nota_ligado`. Não repete antes de `aviso_repetir_dias` (3), a não ser que o lead tenha escrito depois do último aviso. O resultado fica em `followup_analises.aviso_nota` (postada, repetida, desligada, erro) e em `followup_leads.ultimo_aviso_at/ultimo_aviso_texto`. A nota não aparece na lista de mensagens nem dispara o webhook.
+- Próximos canais de aviso combinados: etiqueta no contato (2) e resumo diário (3).
 - Secrets `FRONT_API_TOKEN` e `OPENAI_API_KEY` cadastrados em 25/11 (sem eles a função responde 503). Primeiro teste real no mesmo dia: 24 leads, sem erro.
 - Pendente: a base oficial na tabela `cursos` (vazia).
 - Teste manual: `select public.disparar_varredura();` e depois `net._http_response`. Fora do horário comercial, a função só roda com `?forcar=1`.
