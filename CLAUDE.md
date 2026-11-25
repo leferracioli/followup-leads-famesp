@@ -31,7 +31,7 @@ Definidas com conversas reais de março e abril de 2026 (análise no doc vivo). 
 
 O motivo do "agora" é só informativo (`motivo_conhecido`): perguntar ou não não mudou a conversão.
 
-Estados que valem em qualquer fase: `objecao` (preco, horario_rotina, distancia_logistica, concorrente, terceiro_decide, pre_requisito, outra) e `situacao` (em_andamento, pendencia_nossa, sem_turma). Pendência nossa e sem turma viram aviso ao vendedor, não mensagem ao lead.
+Estados que valem em qualquer fase: `objecao` (preco, horario_rotina, distancia_logistica, concorrente, terceiro_decide, pre_requisito, outra) e `situacao` (em_andamento, pendencia_nossa, sem_turma, sem_conversa). Pendência nossa, sem turma e sem conversa viram aviso ao vendedor, não mensagem ao lead.
 
 Todo follow-up termina oferecendo **dois horários** para o retorno.
 
@@ -49,6 +49,8 @@ RLS ligado em todas as tabelas, sem policies: só a service role acessa.
 ## Fatos aprendidos com payloads reais
 
 - O payload traz `content.userId` (dono), `sessionId`, `direction`, `timestamp`, `templateId`, `status` e `details.from/to`.
+- A Meta recusa template de **Marketing** para quem já recebeu muitos (erro 131049, limite por usuário): na régua automática do time, 4 de 5 mensagens falharam para um mesmo lead. O follow-up fora da janela de 24h precisa de template de **Utilidade**.
+- Mensagem com `status` FAILED fica no histórico do Front; a varredura ignora.
 - `options.senderId` no `send/text` **volta vazio**, então não serve para marcar mensagem do bot.
 - Envio pela API (`send/text`) não gerou evento no webhook filtrado.
 - O agendamento nativo do Front (`scheduled-message`) só aceita TEMPLATE ou CHATBOT.
@@ -61,12 +63,14 @@ RLS ligado em todas as tabelas, sem policies: só a service role acessa.
 - Regras fixas antes da IA, nesta ordem:
   1. Lead falou por último (ignorando o fluxo do bot) → corrige o estado e espera o vendedor.
   2. Nossa última mensagem é campanha ou follow-up automático de menos de 24h → ainda não é lead parado; volta 24h depois dela.
-  3. Última mensagem nossa só SENT (não entregue) → espera 3h, e depois de 3 dias avisa o vendedor.
+  3. Lead que nunca escreveu e nunca falou com vendedor (só recebeu automação) → `situacao = sem_conversa`, avisa o vendedor para fazer o primeiro contato, sem chamar a IA.
+  4. Última mensagem nossa só SENT (não entregue) → espera 3h, e depois de 3 dias avisa o vendedor.
 - **Leitura não conta**: a confirmação de leitura não é confiável.
-- IA: `followup_config.modelo_ia` (padrão `claude-opus-5-5`), saída JSON estruturada. Decisões: `enviar` | `agendar` | `avisar_vendedor` | `optout` (+ `aguardar` só por regra).
+- IA: **OpenAI** (Chat Completions com Structured Outputs `strict`, chamada por `fetch`), modelo em `followup_config.modelo_ia` (padrão `gpt-5.6`), `reasoning_effort` medium. Trocada da Anthropic em 25/11 por escolha da Letícia. Decisões: `enviar` | `agendar` | `avisar_vendedor` | `optout` (+ `aguardar` só por regra).
 - Régua fantasma: `enviar` avança `etapa_regua` (F2 no dia seguinte, F3 três dias depois, depois `repescagem`). Lead em repescagem volta a `ativo` quando alguém escreve.
 - **Nada é enviado**, mesmo com `envio_ligado = true`: o envio ainda não foi implementado.
-- Pendente: secrets `FRONT_API_TOKEN` e `ANTHROPIC_API_KEY` na função (sem eles ela responde 503) e a base oficial na tabela `cursos` (vazia).
+- Secrets `FRONT_API_TOKEN` e `OPENAI_API_KEY` cadastrados em 25/11 (sem eles a função responde 503). Primeiro teste real no mesmo dia: 24 leads, sem erro.
+- Pendente: a base oficial na tabela `cursos` (vazia).
 - Teste manual: `select public.disparar_varredura();` e depois `net._http_response`. Fora do horário comercial, a função só roda com `?forcar=1`.
 
 ## Convenções

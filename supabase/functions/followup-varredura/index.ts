@@ -1,25 +1,26 @@
 import { createClient } from "jsr:@supabase/supabase-js@2";
-import Anthropic from "npm:@anthropic-ai/sdk@1.14.0";
 
 // Varredura de hora em hora em MODO SOMBRA.
 // Para cada lead vencido: le o historico no Front, aplica as regras fixas, chama a IA e grava
 // fase, checklist, resumo, decisao e mensagem sugerida em followup_analises. NAO envia nada.
 //
 // Chamada pelo pg_cron com o header x-varredura-token (valor em followup_config.varredura_token).
-// Secrets necessarios na Edge Function: FRONT_API_TOKEN e ANTHROPIC_API_KEY.
+// Secrets necessarios na Edge Function: FRONT_API_TOKEN e OPENAI_API_KEY.
+// A IA e a OpenAI (Chat Completions com Structured Outputs); o modelo vem de followup_config.modelo_ia.
 // ?forcar=1 roda fora do horario comercial (para teste manual).
 
 declare const EdgeRuntime: { waitUntil(p: Promise<unknown>): void } | undefined;
 
 const FRONT_API = Deno.env.get("FRONT_API_BASE") ?? "https://api.wts.chat/chat";
 const FRONT_TOKEN = Deno.env.get("FRONT_API_TOKEN") ?? "";
-const ANTHROPIC_KEY = Deno.env.get("ANTHROPIC_API_KEY") ?? "";
+const OPENAI_KEY = Deno.env.get("OPENAI_API_KEY") ?? "";
+const OPENAI_API = Deno.env.get("OPENAI_API_BASE") ?? "https://api.openai.com/v1";
+const MODELO_PADRAO = "gpt-5.6";
 
 const db = createClient(
   Deno.env.get("SUPABASE_URL")!,
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
 );
-const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY, maxRetries: 2 });
 
 const CONCORRENCIA = 4;
 const MAX_MSGS_HISTORICO = 60;
@@ -150,6 +151,7 @@ A fase é o ponto MAIS AVANÇADO que a conversa já atingiu, mesmo que etapas an
 - situacao:
   - "pendencia_nossa": o lead fez uma pergunta ou pedido que ninguém respondeu, ou ainda espera o primeiro atendimento humano. Decisão: avisar_vendedor, dizendo o que falta responder.
   - "sem_turma": o curso pedido não existe ou está sem turma aberta, e nenhuma alternativa foi aceita. Decisão: avisar_vendedor ("colocar na lista de espera" ou "oferecer o curso X").
+  - "sem_conversa": o lead só recebeu AUTOMAÇÃO e nunca conversou com um vendedor nem respondeu nada. Decisão: avisar_vendedor ("descubra o curso e faça o primeiro contato").
   - "em_andamento": todos os outros casos.
 
 ## Régua
@@ -160,7 +162,7 @@ A fase é o ponto MAIS AVANÇADO que a conversa já atingiu, mesmo que etapas an
 ## Decisão
 - "enviar": dá para retomar agora. Escreva a mensagem.
 - "agendar": o lead disse quando volta ("te falo amanhã", "depois do dia 5", "meu salário cai sexta"). Informe agendar_para (ISO 8601 com fuso -03:00) e não escreva mensagem.
-- "avisar_vendedor": situacao pendencia_nossa ou sem_turma; não dá para identificar a fase; contexto sensível (reclamação, cancelamento, problema financeiro grave, luto, saúde); ou a objeção só se resolve com algo que não está na conversa nem na base (desconto novo, unidade em outra cidade). Escreva alerta_vendedor em uma frase dizendo o que o vendedor deve fazer.
+- "avisar_vendedor": situacao pendencia_nossa, sem_turma ou sem_conversa; não dá para identificar a fase; contexto sensível (reclamação, cancelamento, problema financeiro grave, luto, saúde); ou a objeção só se resolve com algo que não está na conversa nem na base (desconto novo, unidade em outra cidade). Escreva alerta_vendedor em uma frase dizendo o que o vendedor deve fazer.
 - "optout": o lead pediu para não ser mais contatado ou disse claramente que não tem interesse.
 
 ## Regras da mensagem (quando decisao = "enviar")
@@ -192,7 +194,7 @@ const FASES = ["encaixe", "apresentacao", "decisao", "inscricao"] as const;
 const OBJECOES = [
   "preco", "horario_rotina", "distancia_logistica", "concorrente", "terceiro_decide", "pre_requisito", "outra",
 ] as const;
-const SITUACOES = ["em_andamento", "pendencia_nossa", "sem_turma"] as const;
+const SITUACOES = ["em_andamento", "pendencia_nossa", "sem_turma", "sem_conversa"] as const;
 
 const SCHEMA = {
   type: "object",
@@ -274,29 +276,46 @@ async function analisarComIA(
     "</conversa>",
   ].join("\n");
 
-  const resp = await anthropic.beta.messages.create({
+  // O SISTEMA vem primeiro e nao muda: a OpenAI faz cache automatico do prefixo repetido.
+  const resp = await chamarOpenAI({
     model: ctx.modelo,
-    max_tokens: 4000,
-    betas: ["server-side-fallback-2026-07-01"],
-    fallbacks: "default",
-    output_config: { effort: "medium", format: { type: "json_schema", schema: SCHEMA } },
-    system: [{ type: "text", text: SISTEMA, cache_control: { type: "ephemeral" } }],
-    messages: [{ role: "user", content: usuario }],
-  // deno-lint-ignore no-explicit-any
-  } as any);
+    reasoning_effort: "medium",
+    max_completion_tokens: 8000, // inclui os tokens de raciocinio
+    response_format: { type: "json_schema", json_schema: { name: "analise_followup", strict: true, schema: SCHEMA } },
+    messages: [
+      { role: "developer", content: SISTEMA },
+      { role: "user", content: usuario },
+    ],
+  });
 
-  if (resp.stop_reason === "refusal") throw new Error("IA recusou a análise");
-  if (resp.stop_reason === "max_tokens") throw new Error("IA cortada por max_tokens");
-  // deno-lint-ignore no-explicit-any
-  const texto = (resp.content as any[]).filter((b) => b.type === "text").map((b) => b.text).join("");
-  const saida = JSON.parse(texto) as Saida;
+  const escolha = resp.choices?.[0];
+  if (escolha?.message?.refusal) throw new Error(`IA recusou a análise: ${escolha.message.refusal}`);
+  if (escolha?.finish_reason === "length") throw new Error("IA cortada por max_completion_tokens");
+  const saida = JSON.parse(escolha?.message?.content ?? "") as Saida;
   return {
     saida,
     modelo: resp.model,
-    tokensEntrada: resp.usage.input_tokens + (resp.usage.cache_read_input_tokens ?? 0) +
-      (resp.usage.cache_creation_input_tokens ?? 0),
-    tokensSaida: resp.usage.output_tokens,
+    tokensEntrada: resp.usage?.prompt_tokens ?? null,
+    tokensSaida: resp.usage?.completion_tokens ?? null,
   };
+}
+
+// Chat Completions com 2 novas tentativas em 429 e 5xx.
+async function chamarOpenAI(corpo: Record<string, unknown>): Promise<Msg> {
+  for (let tentativa = 0;; tentativa++) {
+    const r = await fetch(`${OPENAI_API}/chat/completions`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${OPENAI_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify(corpo),
+    });
+    if (r.ok) return await r.json();
+    const erro = `OpenAI ${r.status}: ${(await r.text()).slice(0, 300)}`;
+    if ((r.status === 429 || r.status >= 500) && tentativa < 2) {
+      await new Promise((ok) => setTimeout(ok, 2000 * (tentativa + 1)));
+      continue;
+    }
+    throw new Error(erro);
+  }
 }
 
 // ---------- processamento de um lead ----------
@@ -358,7 +377,20 @@ async function processarLead(lead: Lead, cfg: Record<string, string>, cursos: st
     return;
   }
 
-  // Regra 3: nao empilhar mensagem sobre uma que nem foi entregue.
+  // Regra 3: lead que so recebeu automacao e nunca conversou (nem escreveu, nem falou com vendedor).
+  // Nao ha conversa para retomar: falta o primeiro contato humano. Nao gasta IA.
+  const vendedorFalou = msgs.some((m) => !doLead(m) && !fluxoDoBot(m) && !automacao(m));
+  if (!ultLead && !vendedorFalou) {
+    await registrar(lead, {
+      origem: "regra", decisao: "avisar_vendedor", situacao: "sem_conversa", dentro_janela_24h: false,
+      motivo: "Só recebeu automação e nunca conversou: falta o primeiro contato humano.",
+      alerta_vendedor: "Lead nunca conversou com ninguém, só recebeu automação. Descubra o curso de interesse " +
+        "(cadastro, site ou origem da campanha) e faça o primeiro contato.",
+    });
+    return;
+  }
+
+  // Regra 4: nao empilhar mensagem sobre uma que nem foi entregue.
   if (!nossaEntregue) {
     const parada = Date.now() - quando(ultima);
     if (parada > NAO_ENTREGUE_LIMITE_MS) {
@@ -378,7 +410,7 @@ async function processarLead(lead: Lead, cfg: Record<string, string>, cursos: st
 
   try {
     const r = await analisarComIA(lead, msgs, {
-      etapa, dentroJanela, cursos, modelo: cfg.modelo_ia || "claude-opus-5-5",
+      etapa, dentroJanela, cursos, modelo: cfg.modelo_ia || MODELO_PADRAO,
     });
     const s = r.saida;
     if (s.decisao === "agendar" && (!s.agendar_para || isNaN(new Date(s.agendar_para).getTime()))) {
@@ -459,7 +491,7 @@ Deno.serve(async (req: Request) => {
   const token = req.headers.get("x-varredura-token");
   if (!token || token !== cfg.varredura_token) return json({ erro: "nao autorizado" }, 401);
 
-  const faltando = [!FRONT_TOKEN && "FRONT_API_TOKEN", !ANTHROPIC_KEY && "ANTHROPIC_API_KEY"].filter(Boolean);
+  const faltando = [!FRONT_TOKEN && "FRONT_API_TOKEN", !OPENAI_KEY && "OPENAI_API_KEY"].filter(Boolean);
   if (faltando.length) return json({ erro: "faltam secrets", faltando }, 503);
 
   const forcar = new URL(req.url).searchParams.get("forcar") === "1";
