@@ -474,6 +474,148 @@ async function avisarVendedor(lead: Lead, p: Record<string, unknown>) {
   }
 }
 
+// ---------- regras fixas (antes da IA) ----------
+
+function contexto(msgs: Msg[]) {
+  // O fluxo do bot (menu, "um consultor vai te atender") nao conta como quem falou por ultimo.
+  const conversa = msgs.filter((m) => !fluxoDoBot(m));
+  const ultima = conversa[conversa.length - 1] ?? msgs[msgs.length - 1];
+  const ultLead = [...msgs].reverse().find(doLead);
+  const ultNossa = [...conversa].reverse().find((m) => !doLead(m));
+  const dentroJanela = !!ultLead && Date.now() - quando(ultLead) < JANELA_24H_MS;
+  // A confirmacao de leitura nao e confiavel (lead responde mensagem "nao lida").
+  // O que conta e a entrega: mensagem que ficou so como SENT nao chegou ao aparelho.
+  const nossaEntregue = !ultNossa || ultNossa.status === "DELIVERED" || ultNossa.status === "READ" ||
+    !!ultNossa.readContactAt;
+  return { conversa, ultima, ultLead, ultNossa, dentroJanela, nossaEntregue };
+}
+
+// Devolve a analise de regra (sem IA), ou null quando o lead deve ir para a IA.
+function regraFixa(msgs: Msg[]): Record<string, unknown> | null {
+  const { conversa, ultima, ultLead, ultNossa, dentroJanela, nossaEntregue } = contexto(msgs);
+
+  // Regra 1: o lead falou por ultimo (o webhook perdeu o evento). A bola esta com o vendedor.
+  if (doLead(ultima)) {
+    return {
+      origem: "regra", decisao: "aguardar", lead_falou_por_ultimo: true, proximo_followup_at: null,
+      motivo: "No Front, a última mensagem é do lead: cabe ao vendedor responder.",
+      dentro_janela_24h: dentroJanela,
+    };
+  }
+
+  // Regra 2: lead que recebeu campanha ou follow-up automatico nas ultimas 24h ainda nao e lead
+  // parado: a automacao esta trabalhando. So vale se nenhum vendedor escreveu depois dela.
+  const ultAuto = [...conversa].reverse().find(automacao);
+  if (ultAuto && ultAuto === ultNossa && Date.now() - quando(ultAuto) < JANELA_24H_MS) {
+    return {
+      origem: "regra", decisao: "aguardar", dentro_janela_24h: dentroJanela,
+      proximo_followup_at: new Date(quando(ultAuto) + JANELA_24H_MS).toISOString(),
+      motivo: "Recebeu campanha ou follow-up automático há menos de 24h: ainda não é lead parado.",
+    };
+  }
+
+  // Regra 3: lead que so recebeu automacao e nunca conversou (nem escreveu, nem falou com vendedor).
+  // Nao ha conversa para retomar: falta o primeiro contato humano. Nao gasta IA.
+  const vendedorFalou = msgs.some((m) => !doLead(m) && !fluxoDoBot(m) && !automacao(m));
+  if (!ultLead && !vendedorFalou) {
+    return {
+      origem: "regra", decisao: "avisar_vendedor", situacao: "sem_conversa", dentro_janela_24h: false,
+      motivo: "Só recebeu automação e nunca conversou: falta o primeiro contato humano.",
+      alerta_vendedor: "Lead nunca conversou com ninguém, só recebeu automação. Descubra o curso de interesse " +
+        "(cadastro, site ou origem da campanha) e faça o primeiro contato.",
+    };
+  }
+
+  // Regra 4: nao empilhar mensagem sobre uma que nem foi entregue.
+  if (!nossaEntregue) {
+    const parada = Date.now() - quando(ultima);
+    return parada > NAO_ENTREGUE_LIMITE_MS
+      ? {
+        origem: "regra", decisao: "avisar_vendedor", ultima_nossa_entregue: false, dentro_janela_24h: dentroJanela,
+        motivo: "Última mensagem sem entrega há mais de 3 dias.",
+        alerta_vendedor: "As mensagens não chegam ao lead há 3 dias: tente ligação ou confira o número.",
+      }
+      : {
+        origem: "regra", decisao: "aguardar", ultima_nossa_entregue: false, dentro_janela_24h: dentroJanela,
+        motivo: "Última mensagem do vendedor ficou só como SENT (não entregue): não empilhar.",
+      };
+  }
+  return null;
+}
+
+// ---------- modo leitura: relatorio sem efeito colateral ----------
+// Mesmas regras e mesma IA, mas so grava em followup_leituras: nao mexe em followup_leads,
+// nao poe nota nem etiqueta no Front.
+
+type SessaoLeitura = { id: string; titulo?: string; status?: string; departamento?: string };
+
+async function lerSessao(lote: string, s: SessaoLeitura, cfg: Record<string, string>, catalogo: Curso[]) {
+  const base = { lote, session_id: s.id, titulo: s.titulo ?? null, status_sessao: s.status ?? null,
+    departamento: s.departamento ?? null };
+  let msgs: Msg[];
+  try {
+    msgs = await historico(s.id);
+  } catch (e) {
+    await db.from("followup_leituras").insert({ ...base, origem: "erro", erro: String(e).slice(0, 500) });
+    return;
+  }
+  const datas = {
+    ultima_msg_lead_at: msgs.filter(doLead).map(quando).sort().map((t) => new Date(t).toISOString()).at(-1) ?? null,
+    ultima_msg_nossa_at: msgs.filter((m) => !doLead(m)).map(quando).sort().map((t) => new Date(t).toISOString())
+      .at(-1) ?? null,
+  };
+  if (!msgs.length) {
+    await db.from("followup_leituras").insert({ ...base, origem: "regra", decisao: "sem_mensagens",
+      motivo: "Sessão sem mensagens no Front." });
+    return;
+  }
+  const regra = regraFixa(msgs);
+  if (regra) {
+    await db.from("followup_leituras").insert({
+      ...base, ...datas, origem: "regra", decisao: regra.decisao, motivo: regra.motivo,
+      situacao: regra.situacao ?? null, alerta_vendedor: regra.alerta_vendedor ?? null,
+      dentro_janela_24h: regra.dentro_janela_24h ?? null,
+    });
+    return;
+  }
+  const { dentroJanela } = contexto(msgs);
+  const leadNovo = {
+    session_id: s.id, lead_nome: null, vendedor_id: null, fase: "encaixe", checklist: {}, objecao: null,
+    resumo: null, etapa_regua: 0, atualizado_em: "", ultima_msg_lead_at: null, ultimo_aviso_at: null,
+    etiqueta_fup: null,
+  } as Lead;
+  try {
+    const cursos = catalogo.length ? blocoCatalogo(catalogo, transcrever(msgs)) : "";
+    const r = await analisarComIA(leadNovo, msgs, {
+      etapa: 1, dentroJanela, cursos, modelo: cfg.modelo_ia || MODELO_PADRAO,
+    });
+    const x = r.saida;
+    await db.from("followup_leituras").insert({
+      ...base, ...datas, origem: "ia", decisao: x.decisao, motivo: x.motivo, fase: x.fase, situacao: x.situacao,
+      objecao: x.objecao, resumo: x.resumo?.slice(0, 300), checklist: x.checklist,
+      mensagem_sugerida: x.decisao === "enviar" ? x.mensagem : null,
+      alerta_vendedor: x.decisao === "avisar_vendedor" ? x.alerta_vendedor : null,
+      dentro_janela_24h: dentroJanela, modelo: r.modelo, tokens_entrada: r.tokensEntrada, tokens_saida: r.tokensSaida,
+    });
+  } catch (e) {
+    await db.from("followup_leituras").insert({ ...base, ...datas, origem: "erro", erro: String(e).slice(0, 500) });
+  }
+}
+
+async function leitura(lote: string, sessoes: SessaoLeitura[], cfg: Record<string, string>) {
+  const catalogo = await catalogoDaRodada();
+  let i = 0;
+  const trabalhador = async () => {
+    while (i < sessoes.length) {
+      const s = sessoes[i++];
+      await lerSessao(lote, s, cfg, catalogo).catch((e) => console.error("leitura", s.id, e));
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(CONCORRENCIA, sessoes.length) }, trabalhador));
+  console.log(`leitura ${lote}: ${sessoes.length} sessão(ões)`);
+  return { lidas: sessoes.length };
+}
+
 async function processarLead(lead: Lead, cfg: Record<string, string>, catalogo: Curso[]) {
   const etapa = lead.etapa_regua + 1;
   let msgs: Msg[];
@@ -489,67 +631,10 @@ async function processarLead(lead: Lead, cfg: Record<string, string>, catalogo: 
     return;
   }
 
-  // O fluxo do bot (menu, "um consultor vai te atender") nao conta como quem falou por ultimo.
-  const conversa = msgs.filter((m) => !fluxoDoBot(m));
-  const ultima = conversa[conversa.length - 1] ?? msgs[msgs.length - 1];
-  const ultLead = [...msgs].reverse().find(doLead);
-  const ultNossa = [...conversa].reverse().find((m) => !doLead(m));
-  const dentroJanela = !!ultLead && Date.now() - quando(ultLead) < JANELA_24H_MS;
-  // A confirmacao de leitura nao e confiavel (lead responde mensagem "nao lida").
-  // O que conta e a entrega: mensagem que ficou so como SENT nao chegou ao aparelho.
-  const nossaEntregue = !ultNossa || ultNossa.status === "DELIVERED" || ultNossa.status === "READ" ||
-    !!ultNossa.readContactAt;
-
-  // Regra 1: o lead falou por ultimo (o webhook perdeu o evento). A bola esta com o vendedor.
-  if (doLead(ultima)) {
-    await registrar(lead, {
-      origem: "regra", decisao: "aguardar", lead_falou_por_ultimo: true, proximo_followup_at: null,
-      motivo: "No Front, a última mensagem é do lead: cabe ao vendedor responder.",
-      dentro_janela_24h: dentroJanela,
-    });
-    return;
-  }
-
-  // Regra 2: lead que recebeu campanha ou follow-up automatico nas ultimas 24h ainda nao e lead
-  // parado: a automacao esta trabalhando. So vale se nenhum vendedor escreveu depois dela.
-  const ultAuto = [...conversa].reverse().find(automacao);
-  if (ultAuto && ultAuto === ultNossa && Date.now() - quando(ultAuto) < JANELA_24H_MS) {
-    await registrar(lead, {
-      origem: "regra", decisao: "aguardar", dentro_janela_24h: dentroJanela,
-      proximo_followup_at: new Date(quando(ultAuto) + JANELA_24H_MS).toISOString(),
-      motivo: "Recebeu campanha ou follow-up automático há menos de 24h: ainda não é lead parado.",
-    });
-    return;
-  }
-
-  // Regra 3: lead que so recebeu automacao e nunca conversou (nem escreveu, nem falou com vendedor).
-  // Nao ha conversa para retomar: falta o primeiro contato humano. Nao gasta IA.
-  const vendedorFalou = msgs.some((m) => !doLead(m) && !fluxoDoBot(m) && !automacao(m));
-  if (!ultLead && !vendedorFalou) {
-    await registrar(lead, {
-      origem: "regra", decisao: "avisar_vendedor", situacao: "sem_conversa", dentro_janela_24h: false,
-      motivo: "Só recebeu automação e nunca conversou: falta o primeiro contato humano.",
-      alerta_vendedor: "Lead nunca conversou com ninguém, só recebeu automação. Descubra o curso de interesse " +
-        "(cadastro, site ou origem da campanha) e faça o primeiro contato.",
-    });
-    return;
-  }
-
-  // Regra 4: nao empilhar mensagem sobre uma que nem foi entregue.
-  if (!nossaEntregue) {
-    const parada = Date.now() - quando(ultima);
-    if (parada > NAO_ENTREGUE_LIMITE_MS) {
-      await registrar(lead, {
-        origem: "regra", decisao: "avisar_vendedor", ultima_nossa_entregue: false, dentro_janela_24h: dentroJanela,
-        motivo: "Última mensagem sem entrega há mais de 3 dias.",
-        alerta_vendedor: "As mensagens não chegam ao lead há 3 dias: tente ligação ou confira o número.",
-      });
-    } else {
-      await registrar(lead, {
-        origem: "regra", decisao: "aguardar", ultima_nossa_entregue: false, dentro_janela_24h: dentroJanela,
-        motivo: "Última mensagem do vendedor ficou só como SENT (não entregue): não empilhar.",
-      });
-    }
+  const { dentroJanela } = contexto(msgs);
+  const regra = regraFixa(msgs);
+  if (regra) {
+    await registrar(lead, regra);
     return;
   }
 
@@ -645,7 +730,23 @@ Deno.serve(async (req: Request) => {
   const faltando = [!FRONT_TOKEN && "FRONT_API_TOKEN", !OPENAI_KEY && "OPENAI_API_KEY"].filter(Boolean);
   if (faltando.length) return json({ erro: "faltam secrets", faltando }, 503);
 
-  const forcar = new URL(req.url).searchParams.get("forcar") === "1";
+  const url = new URL(req.url);
+
+  // Modo leitura: POST ?leitura=1 com { lote, sessoes: [{ id, titulo?, status?, departamento? }] }.
+  if (url.searchParams.get("leitura") === "1") {
+    const corpo = await req.json().catch(() => null);
+    const sessoes: SessaoLeitura[] = Array.isArray(corpo?.sessoes) ? corpo.sessoes.filter((s: SessaoLeitura) => s?.id) : [];
+    if (!corpo?.lote || !sessoes.length) return json({ erro: "informe lote e sessoes" }, 400);
+    if (sessoes.length > 40) return json({ erro: "no máximo 40 sessões por chamada" }, 400);
+    const tarefaLeitura = leitura(String(corpo.lote), sessoes, cfg).catch((e) => console.error("leitura", e));
+    if (typeof EdgeRuntime !== "undefined" && EdgeRuntime?.waitUntil) {
+      EdgeRuntime.waitUntil(tarefaLeitura);
+      return json({ ok: true, modo: "leitura", queued: sessoes.length });
+    }
+    return json({ ok: true, modo: "leitura", ...(await tarefaLeitura) });
+  }
+
+  const forcar = url.searchParams.get("forcar") === "1";
   if (!forcar && !dentroHorarioComercial()) return json({ ok: true, pulado: "fora do horario comercial" });
 
   // Nesta fase nada e enviado, mesmo com envio_ligado = true: o envio ainda nao foi implementado.

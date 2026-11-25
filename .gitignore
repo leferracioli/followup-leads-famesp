@@ -3,3 +3,6 @@
 supabase/.temp/
 supabase/.branches/
 node_modules/
+
+# Relatórios com dados de leads (não versionar)
+relatorios/
