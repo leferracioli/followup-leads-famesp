@@ -4,6 +4,8 @@ import { createClient } from "jsr:@supabase/supabase-js@2";
 //
 // GET ?vendedor=<nome no painel>  -> so os leads daquele vendedor
 // GET ?todos=1                    -> todos os vendedores (visao de diretoria/admin)
+// Cada vendedor traz "leads" (so os com etiqueta FUP, pedindo acao) e "pipeline" (todos os
+// leads ativos por fase do funil, com ou sem etiqueta) + matriculados nos ultimos 30 dias.
 // Header x-painel-key = followup_config.painel_key. O painel e publico, entao a chave so
 // evita acesso casual: a resposta traz o MINIMO (primeiro nome, etiqueta, datas e link do
 // Front, que exige login). Resumo, telefone e texto do aviso ficam na nota dentro do Front.
@@ -12,6 +14,8 @@ const FRONT_API = Deno.env.get("FRONT_API_BASE") ?? "https://api.wts.chat/chat";
 const FRONT_TOKEN = Deno.env.get("FRONT_API_TOKEN") ?? "";
 const LINK_FRONT = "https://frontcrm.wts.chat/redirect?type=SESSION&id=";
 const SYNC_MIN = 15; // relê dono e nome da sessao no Front a cada 15 min, no maximo
+const SYNC_MAX = 40; // sessoes relidas por chamada (as mais velhas primeiro)
+const COLUNAS = ["primeiro_contato", "em_conversa", "encaixe", "apresentacao", "decisao", "inscricao"] as const;
 
 const db = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
 
@@ -31,12 +35,16 @@ type Lead = {
   session_id: string;
   lead_nome: string | null;
   vendedor_id: string | null;
-  etiqueta_fup: string;
+  etiqueta_fup: string | null;
   etiqueta_desde: string | null;
   ultima_msg_lead_at: string | null;
   ultima_msg_nossa_at: string | null;
   sessao_sync_em: string | null;
   sessao_status: string | null;
+  status: string;
+  fase: string | null;
+  situacao: string | null;
+  fase_lida_em: string | null;
 };
 
 // Dono atual da sessao e nome do contato, lidos do Front (o webhook nem sempre traz).
@@ -77,51 +85,94 @@ Deno.serve(async (req: Request) => {
   const todos = url.searchParams.get("todos") === "1";
   if (!filtro && !todos) return json({ erro: "informe vendedor ou todos=1" }, 400);
 
-  const [{ data: leads, error }, { data: vendedores }] = await Promise.all([
+  const desde30 = new Date(Date.now() - 30 * 86_400_000).toISOString();
+  const [{ data: leads, error }, { data: vendedores }, { data: matriculados }] = await Promise.all([
     db.from("followup_leads")
       .select(
-        "session_id, lead_nome, vendedor_id, etiqueta_fup, etiqueta_desde, ultima_msg_lead_at, ultima_msg_nossa_at, sessao_sync_em, sessao_status",
+        "session_id, lead_nome, vendedor_id, etiqueta_fup, etiqueta_desde, ultima_msg_lead_at, ultima_msg_nossa_at, sessao_sync_em, sessao_status, status, fase, situacao, fase_lida_em",
       )
-      .not("etiqueta_fup", "is", null)
       .in("status", ["ativo", "repescagem"]),
     db.from("vendedores").select("front_user_id, nome_painel").eq("ativo", true),
+    db.from("followup_leads").select("vendedor_id").eq("status", "matriculado").gte("atualizado_em", desde30),
   ]);
   if (error) return json({ erro: "falha ao ler leads" }, 500);
 
-  // Atualiza dono/nome no Front quando faltam ou estao velhos (5 em paralelo).
+  // Atualiza dono/nome/status no Front quando faltam ou estao velhos (5 em paralelo, ate SYNC_MAX).
   const lista = (leads ?? []) as Lead[];
   const limite = Date.now() - SYNC_MIN * 60_000;
-  const velhos = lista.filter((l) => !l.sessao_sync_em || new Date(l.sessao_sync_em).getTime() < limite);
+  const velhos = lista
+    .filter((l) => !l.sessao_sync_em || new Date(l.sessao_sync_em).getTime() < limite)
+    // Com etiqueta primeiro (sao os que pedem acao), depois os nunca sincronizados, depois os mais velhos.
+    .sort((a, b) =>
+      Number(!a.etiqueta_fup) - Number(!b.etiqueta_fup) ||
+      (a.sessao_sync_em ?? "").localeCompare(b.sessao_sync_em ?? "")
+    )
+    .slice(0, SYNC_MAX);
   for (let i = 0; i < velhos.length; i += 5) {
     await Promise.all(velhos.slice(i, i + 5).map((l) => sincronizar(l).catch(() => {})));
   }
 
   const nomePainel = new Map((vendedores ?? []).map((v) => [v.front_user_id, v.nome_painel]));
-  const grupos = new Map<string, { nome: string; total: number; por_etiqueta: Record<string, number>; leads: unknown[] }>();
+  const nomeDe = (id: string | null) => (id && nomePainel.get(id)) || "Sem vendedor";
+  type Grupo = {
+    nome: string;
+    total: number;
+    por_etiqueta: Record<string, number>;
+    leads: { desde: string | null }[];
+    pipeline: Record<string, { ultimo_contato: string | null }[]>;
+    matriculados_30d: number;
+  };
+  const grupos = new Map<string, Grupo>();
+  const grupo = (nome: string) => {
+    let g = grupos.get(nome);
+    if (!g) {
+      g = { nome, total: 0, por_etiqueta: {}, leads: [], pipeline: Object.fromEntries(COLUNAS.map((c) => [c, []])), matriculados_30d: 0 };
+      grupos.set(nome, g);
+    }
+    return g;
+  };
+
   for (const l of lista) {
     if (l.sessao_status === "COMPLETED") continue; // conversa encerrada no Front: sai do card
-    const vendedor = (l.vendedor_id && nomePainel.get(l.vendedor_id)) || "Sem vendedor";
+    const vendedor = nomeDe(l.vendedor_id);
     if (filtro && vendedor !== filtro) continue;
-    const g = grupos.get(vendedor) ?? { nome: vendedor, total: 0, por_etiqueta: {}, leads: [] };
+    const g = grupo(vendedor);
+    const datas = [l.ultima_msg_lead_at, l.ultima_msg_nossa_at].filter(Boolean) as string[];
+    const ultimo = datas.length ? datas.sort().at(-1)! : null;
+    const base = { nome: primeiroNome(l.lead_nome), etiqueta: l.etiqueta_fup, ultimo_contato: ultimo, link: LINK_FRONT + l.session_id };
+
+    // Sem conversa -> primeiro contato. Fase nunca lida pela IA (o lead ainda nao parou) -> em conversa.
+    const coluna = l.situacao === "sem_conversa"
+      ? "primeiro_contato"
+      : !l.fase_lida_em || !(COLUNAS as readonly string[]).includes(l.fase ?? "")
+      ? "em_conversa"
+      : l.fase!;
+    g.pipeline[coluna].push({ ...base, repescagem: l.status === "repescagem" } as never);
+
+    if (!l.etiqueta_fup) continue;
     g.total++;
     g.por_etiqueta[l.etiqueta_fup] = (g.por_etiqueta[l.etiqueta_fup] ?? 0) + 1;
-    const datas = [l.ultima_msg_lead_at, l.ultima_msg_nossa_at].filter(Boolean) as string[];
-    g.leads.push({
-      nome: primeiroNome(l.lead_nome),
-      etiqueta: l.etiqueta_fup,
-      desde: l.etiqueta_desde,
-      ultimo_contato: datas.length ? datas.sort().at(-1) : null,
-      link: LINK_FRONT + l.session_id,
-    });
-    grupos.set(vendedor, g);
+    g.leads.push({ ...base, desde: l.etiqueta_desde } as never);
+  }
+
+  for (const m of matriculados ?? []) {
+    const vendedor = nomeDe(m.vendedor_id);
+    if (filtro && vendedor !== filtro) continue;
+    grupo(vendedor).matriculados_30d++;
   }
 
   const saida = [...grupos.values()].map((g) => ({
     ...g,
     // Mais antigos primeiro: quem esta parado ha mais tempo aparece no topo.
-    leads: (g.leads as { desde: string | null }[]).sort((a, b) => (a.desde ?? "").localeCompare(b.desde ?? "")),
+    leads: g.leads.sort((a, b) => (a.desde ?? "").localeCompare(b.desde ?? "")),
+    pipeline: Object.fromEntries(
+      Object.entries(g.pipeline).map(([k, v]) => [k, v.sort((a, b) => (a.ultimo_contato ?? "").localeCompare(b.ultimo_contato ?? ""))]),
+    ),
   })).sort((a, b) => b.total - a.total);
 
-  if (filtro && !saida.length) saida.push({ nome: filtro, total: 0, por_etiqueta: {}, leads: [] });
+  if (filtro && !saida.length) {
+    const g = grupo(filtro);
+    saida.push(g);
+  }
   return json({ gerado_em: new Date().toISOString(), vendedores: saida });
 });
