@@ -41,7 +41,7 @@ Todo follow-up termina oferecendo **dois horários** para o retorno.
 - `followup_envios`: log dos follow-ups enviados (retenção de 90 dias).
 - `webhook_amostras`: os primeiros 30 payloads de mensagem, para mapear o formato.
 - `followup_analises`: uma linha por análise da varredura (retenção de 90 dias).
-- `cursos`: base oficial de cursos que a IA pode citar (vazia por enquanto).
+- `cursos`: **não é usada** (vazia). A base oficial vem do catálogo público, lido direto do link (ver abaixo).
 - `followup_config`: `webhook_token`, `envio_ligado` (botão de desligar), `max_amostras`, `vendedores_permitidos` (opcional), `varredura_token`, `max_por_varredura`, `modelo_ia`, `aviso_nota_ligado`, `aviso_repetir_dias`, `etiqueta_ligada`.
 
 RLS ligado em todas as tabelas, sem policies: só a service role acessa.
@@ -73,7 +73,7 @@ RLS ligado em todas as tabelas, sem policies: só a service role acessa.
 - **Etiqueta no contato (no ar desde 25/11):** cada lead tem no máximo uma etiqueta `FUP - …` no contato do Front (API core: `POST https://api.wts.chat/core/v1/contact/{contactId}/tags` com `InsertIfNotExists` / `DeleteIfExists`, **nunca `ReplaceAll`**: as réguas do time dependem das próprias etiquetas, como `ABANDONO_ROBO`). Os nomes são: `FUP - Responder lead` (pendencia_nossa), `FUP - Primeiro contato` (sem_conversa), `FUP - Sem turma` e `FUP - Ver conversa` (outros avisos). Sai quando a IA decide enviar, agendar ou optout, ou quando o lead fala por último. Esperas de regra não mexem nela. A varredura cria a etiqueta no Front se ela faltar. Chave `followup_config.etiqueta_ligada`. Estado em `followup_leads.etiqueta_fup` e `followup_analises.etiqueta`.
 - **Card no painel comercial (no ar desde 25/11):** o painel `painel-comercial-famesp.vercel.app` é outro projeto (pasta `Treinamento Comercial - Famesp`, HTML estático no Vercel, sem remoto git). Ele lê do FAMESP Comercial, mas o card de follow-up lê da Edge Function **`followup-painel`** deste projeto (`GET ?vendedor=<nome no painel>` ou `?todos=1`, header `x-painel-key` = `followup_config.painel_key`). Como o painel é público, a função devolve só primeiro nome, etiqueta, datas e o link do Front. A tabela `vendedores` faz o de-para entre usuário do Front e nome no painel. O dono e o nome da sessão são relidos do Front a cada 15 min (`sessao_sync_em`). Deploy: `supabase functions deploy followup-painel --no-verify-jwt`.
 - Secrets `FRONT_API_TOKEN` e `OPENAI_API_KEY` cadastrados em 25/11 (sem eles a função responde 503). Primeiro teste real no mesmo dia: 24 leads, sem erro.
-- Pendente: a base oficial na tabela `cursos` (vazia).
+- **Catálogo de cursos (desde 25/11):** a varredura lê `https://admin.famesp.com.br/catalogo-cursos` (página pública em Next.js) uma vez por rodada, sem gravar no banco (`followup-varredura/catalogo.ts`). Os cursos vêm no fluxo RSC (`self.__next_f.push`); as referências `$7:…:cursos:N:…` são resolvidas no leitor. Para a IA vai o detalhe completo dos até 3 cursos citados na conversa (escolhidos pelos radicais do nome) e a lista com o nome de todos. Se a página cair ou mudar de formato, a análise segue sem catálogo e o erro aparece no log da função. Para testar o leitor localmente: Node 24 importa o `.ts` direto.
 - Teste manual: `select public.disparar_varredura();` e depois `net._http_response`. Fora do horário comercial, a função só roda com `?forcar=1`.
 
 ## Convenções

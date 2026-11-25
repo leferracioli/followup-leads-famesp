@@ -1,4 +1,5 @@
 import { createClient } from "jsr:@supabase/supabase-js@2";
+import { blocoCatalogo, type Curso, lerCatalogo } from "./catalogo.ts";
 
 // Varredura de hora em hora em MODO SOMBRA.
 // Para cada lead vencido: le o historico no Front, aplica as regras fixas, chama a IA e grava
@@ -167,7 +168,7 @@ A fase é o ponto MAIS AVANÇADO que a conversa já atingiu, mesmo que etapas an
 - objecao: a objeção aberta agora, ou null. preco | horario_rotina | distancia_logistica | concorrente (comparando com outra escola) | terceiro_decide (pai, mãe, cônjuge, responsável financeiro) | pre_requisito (idade, formação) | outra.
 - situacao:
   - "pendencia_nossa": o lead fez uma pergunta ou pedido que ninguém respondeu, ou ainda espera o primeiro atendimento humano. Decisão: avisar_vendedor, dizendo o que falta responder.
-  - "sem_turma": o curso pedido não existe ou está sem turma aberta, e nenhuma alternativa foi aceita. Decisão: avisar_vendedor ("colocar na lista de espera" ou "oferecer o curso X").
+  - "sem_turma": o curso pedido não existe ou está sem turma aberta (no catálogo aparece como lista de espera ou sem turma), e nenhuma alternativa foi aceita. Decisão: avisar_vendedor ("colocar na lista de espera" ou "oferecer o curso X").
   - "sem_conversa": o lead só recebeu AUTOMAÇÃO e nunca conversou com um vendedor nem respondeu nada. Decisão: avisar_vendedor ("descubra o curso e faça o primeiro contato").
   - "em_andamento": todos os outros casos.
 
@@ -192,6 +193,7 @@ A fase é o ponto MAIS AVANÇADO que a conversa já atingiu, mesmo que etapas an
 - Parado na inscrição: ofereça ajuda com o passo que travou (dados, pix, comprovante).
 - Termine SEMPRE oferecendo DOIS horários concretos para o retorno, escolhidos da lista de horários disponíveis, em forma de pergunta (ex.: "Posso te chamar quinta às 10h ou às 18h?").
 - Nunca prometa curso, modalidade, turma, horário, preço, desconto ou prazo que não esteja na conversa ou na base de cursos. Se não estiver, não cite.
+- A base de cursos é o catálogo oficial, lido agora. Use-a para confirmar turma, período, início e valores, e para achar uma alternativa mais acessível de verdade (outro período, outra turma, condição de parcelas). Condição com prazo (ex.: "Campanha de 23 a 28 de novembro") só vale dentro do prazo: compare com a data de agora. Cite no máximo um valor por mensagem.
 - Não repita mensagem que o vendedor já mandou. No máximo um emoji.
 - Nunca encerre o contato.
 
@@ -285,7 +287,7 @@ async function analisarComIA(
     }; resumo=${lead.resumo ?? "(nenhum)"}.`,
     "",
     "<base_de_cursos>",
-    ctx.cursos || "(base oficial de cursos ainda não disponível: não cite nada que não esteja na conversa)",
+    ctx.cursos || "(catálogo oficial indisponível nesta rodada: não cite nada que não esteja na conversa)",
     "</base_de_cursos>",
     "",
     "<conversa>",
@@ -472,7 +474,7 @@ async function avisarVendedor(lead: Lead, p: Record<string, unknown>) {
   }
 }
 
-async function processarLead(lead: Lead, cfg: Record<string, string>, cursos: string) {
+async function processarLead(lead: Lead, cfg: Record<string, string>, catalogo: Curso[]) {
   const etapa = lead.etapa_regua + 1;
   let msgs: Msg[];
   try {
@@ -552,6 +554,8 @@ async function processarLead(lead: Lead, cfg: Record<string, string>, cursos: st
   }
 
   try {
+    // Só o detalhe dos cursos citados na conversa (e a lista de nomes) vai para a IA.
+    const cursos = catalogo.length ? blocoCatalogo(catalogo, transcrever(msgs)) : "";
     const r = await analisarComIA(lead, msgs, {
       etapa, dentroJanela, cursos, modelo: cfg.modelo_ia || MODELO_PADRAO,
     });
@@ -594,14 +598,16 @@ async function getConfig(): Promise<Record<string, string>> {
   return Object.fromEntries((data ?? []).map((r) => [r.chave, r.valor]));
 }
 
-async function baseDeCursos(): Promise<string> {
-  const { data } = await db.from("cursos")
-    .select("nome, modalidade, periodos, unidade, carga_horaria, observacoes").eq("ativo", true);
-  if (!data?.length) return "";
-  return data.map((c) =>
-    [c.nome, c.modalidade, c.periodos && `períodos: ${c.periodos}`, c.unidade && `unidade: ${c.unidade}`,
-      c.carga_horaria && `carga: ${c.carga_horaria}`, c.observacoes].filter(Boolean).join(" | ")
-  ).join("\n");
+// Catálogo oficial lido direto do site (uma vez por varredura). Se falhar, segue sem catálogo.
+async function catalogoDaRodada(): Promise<Curso[]> {
+  try {
+    const cursos = await lerCatalogo();
+    console.log(`catálogo: ${cursos.length} cursos lidos`);
+    return cursos;
+  } catch (e) {
+    console.error("catálogo indisponível; análise segue sem ele:", e);
+    return [];
+  }
 }
 
 async function varrer(cfg: Record<string, string>) {
@@ -612,7 +618,7 @@ async function varrer(cfg: Record<string, string>) {
   if (error) throw error;
   const fila = (leads ?? []) as Lead[];
   if (!fila.length) return { analisados: 0 };
-  const cursos = await baseDeCursos();
+  const cursos = await catalogoDaRodada();
 
   let i = 0;
   const trabalhador = async () => {
