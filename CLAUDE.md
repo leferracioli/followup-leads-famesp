@@ -22,15 +22,22 @@ Doc vivo com as decisões, o histórico e as pendências: https://claude.ai/arti
 
 ## Fases do funil (critério de saída)
 
-- **Descoberta:** curso, motivo do "agora" e localização identificados.
-- **Encantamento:** turma, período, horário, carga horária, disciplinas e cronograma apresentados, sem dúvida aberta.
-- **Fechamento:** o lead quer se matricular. O follow-up tira o atrito.
+Definidas com conversas reais de março e abril de 2026 (análise no doc vivo). A fase gravada é a **mais avançada** que o lead já atingiu e nunca volta atrás (`registrar_analise` garante isso). O checklist acumula.
+
+- **Encaixe:** curso definido, turma aberta, pré-requisito atendido (o bot já coleta parte) e período e formato que cabem na rotina e na logística.
+- **Apresentação:** ficha e preço ou condição enviados, e o lead reagiu. O lead costuma pedir o preço cedo.
+- **Decisão:** o lead disse sim, ou a objeção foi tratada com uma alternativa concreta.
+- **Inscrição:** dados, plano de parcelas, pix e comprovante.
+
+O motivo do "agora" é só informativo (`motivo_conhecido`): perguntar ou não não mudou a conversão.
+
+Estados que valem em qualquer fase: `objecao` (preco, horario_rotina, distancia_logistica, concorrente, terceiro_decide, pre_requisito, outra) e `situacao` (em_andamento, pendencia_nossa, sem_turma). Pendência nossa e sem turma viram aviso ao vendedor, não mensagem ao lead.
 
 Todo follow-up termina oferecendo **dois horários** para o retorno.
 
 ## Tabelas
 
-- `followup_leads`: estado por sessão (fase, checklist, resumo de até 300 caracteres, timestamps, `proximo_followup_at`, `etapa_regua`, `status`, `vendedor_id`).
+- `followup_leads`: estado por sessão (fase, checklist, objecao, situacao, resumo de até 300 caracteres, timestamps, `proximo_followup_at`, `etapa_regua`, `status`, `vendedor_id`).
 - `followup_envios`: log dos follow-ups enviados (retenção de 90 dias).
 - `webhook_amostras`: os primeiros 30 payloads de mensagem, para mapear o formato.
 - `followup_analises`: uma linha por análise da varredura (retenção de 90 dias).
@@ -50,7 +57,12 @@ RLS ligado em todas as tabelas, sem policies: só a service role acessa.
 
 - pg_cron `followup-varredura` (`5 11-22 * * 1-6` UTC = 8h05 às 19h05 em SP) chama `disparar_varredura()`, que faz POST na Edge Function `followup-varredura` com o header `x-varredura-token` (valor em `followup_config.varredura_token`).
 - `pegar_vencidos(limite)` reserva até `max_por_varredura` leads por 30 min; `registrar_analise(session, versao, jsonb)` grava em `followup_analises` e só aplica no lead se `atualizado_em` não mudou (senão `aplicada = false`).
-- Regras fixas antes da IA: lead falou por último → corrige estado; última mensagem nossa só SENT (não entregue) → espera 3h, e após 3 dias avisa o vendedor. **Leitura não conta** (a confirmação de leitura não é confiável).
+- Origem das nossas mensagens no Front: `DEFAULT` = vendedor; `BOT` sem `templateId` = fluxo do chatbot; `CAMPAIGN`, ou `BOT` com `templateId` = campanha ou follow-up automático.
+- Regras fixas antes da IA, nesta ordem:
+  1. Lead falou por último (ignorando o fluxo do bot) → corrige o estado e espera o vendedor.
+  2. Nossa última mensagem é campanha ou follow-up automático de menos de 24h → ainda não é lead parado; volta 24h depois dela.
+  3. Última mensagem nossa só SENT (não entregue) → espera 3h, e depois de 3 dias avisa o vendedor.
+- **Leitura não conta**: a confirmação de leitura não é confiável.
 - IA: `followup_config.modelo_ia` (padrão `claude-opus-5-5`), saída JSON estruturada. Decisões: `enviar` | `agendar` | `avisar_vendedor` | `optout` (+ `aguardar` só por regra).
 - Régua fantasma: `enviar` avança `etapa_regua` (F2 no dia seguinte, F3 três dias depois, depois `repescagem`). Lead em repescagem volta a `ativo` quando alguém escreve.
 - **Nada é enviado**, mesmo com `envio_ligado = true`: o envio ainda não foi implementado.
